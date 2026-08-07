@@ -590,7 +590,7 @@ function openclaw_cli_bounded() {
 }
 
 function openclaw_cli_quick() {
-  run_as_openclaw /usr/bin/timeout --foreground --kill-after=1s 3s \
+  run_as_openclaw /usr/bin/timeout --foreground --kill-after=2s 10s \
     "$OPENCLAW_BIN" "$@"
 }
 
@@ -1517,7 +1517,8 @@ function wait_for_managed_browser_running_state() {
   *) return 1 ;;
   esac
 
-  for _ in {1..20}; do
+  local deadline=$((SECONDS + 30))
+  while ((SECONDS < deadline)); do
     if status_json=$(openclaw_cli_quick browser --browser-profile openclaw --json status 2>/dev/null) &&
       is_local_managed_browser_status "$status_json" &&
       jq -e --argjson expected_running "$expected_running" \
@@ -1607,10 +1608,57 @@ function capture_browser_running_state() {
   fi
 }
 
-function browser_failure_looks_like_sandbox() {
+function chromium_output_looks_like_sandbox_failure() {
+  local output="$1"
+
   grep -Eiq \
-    'no usable sandbox|suid sandbox helper|setuid_sandbox|zygote_host_impl_linux|failed to move to new namespace|namespace.*(operation not permitted|permission denied)|sandbox.*(failed|unavailable|not available|permission denied)' \
-    <<<"$browser_probe_output"
+    'no usable sandbox|suid sandbox helper|setuid_sandbox|failed to move to new namespace|namespace.*(operation not permitted|permission denied)|sandbox.*(failed|unavailable|not available|permission denied)' \
+    <<<"$output"
+}
+
+function probe_chromium_internal_sandbox() {
+  local output=""
+  local probe_dir=""
+  local probe_status=0
+
+  probe_dir=$(run_as_openclaw /usr/bin/mktemp -d \
+    /tmp/openclaw-chromium-sandbox.XXXXXX) || return 1
+  if output=$(run_as_openclaw /bin/bash -c '
+    set -Eeuo pipefail
+    cd "$HOME"
+    exec /usr/bin/timeout --kill-after=2s 15s \
+      /usr/bin/chromium \
+      --headless=new \
+      --disable-gpu \
+      --disable-dev-shm-usage \
+      --no-first-run \
+      --no-default-browser-check \
+      --user-data-dir="$1" \
+      --dump-dom \
+      about:blank
+  ' _ "$probe_dir" 2>&1); then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+
+  if [[ "$probe_dir" == /tmp/openclaw-chromium-sandbox.* ]]; then
+    run_as_openclaw /bin/rm -rf -- "$probe_dir" || true
+  fi
+  [[ -z "$output" ]] || browser_probe_output+=$'Direct Chromium sandbox probe:\n'"${output}"$'\n'
+
+  [[ "$probe_status" -ne 0 ]] &&
+    chromium_output_looks_like_sandbox_failure "$output"
+}
+
+function browser_failure_looks_like_sandbox() {
+  if chromium_output_looks_like_sandbox_failure "$browser_probe_output"; then
+    return 0
+  fi
+
+  # The Gateway can surface only a generic timeout when Chromium aborts before
+  # CDP starts. Reproduce the launch directly before offering a weaker sandbox.
+  probe_chromium_internal_sandbox
 }
 
 function prepare_managed_browser_overrides() {
@@ -1715,7 +1763,9 @@ function validate_managed_browser_status() {
   local expected_no_sandbox="$1"
   local status_json
 
-  if ! status_json=$(openclaw_cli_quick browser --browser-profile openclaw --json status); then
+  # The first browser status request after a Gateway restart can take longer
+  # than the quick polling timeout while the CLI warms its module cache.
+  if ! status_json=$(openclaw_cli_bounded browser --browser-profile openclaw --json status); then
     return 1
   fi
 
